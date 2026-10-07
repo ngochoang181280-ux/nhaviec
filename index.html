@@ -14,7 +14,7 @@
 <body>
 <script>
   // Dán URL Web App của Apps Script (kết thúc bằng /exec) vào giữa hai dấu nháy:
-  var WEB_APP_URL='';
+  var WEB_APP_URL='https://script.google.com/macros/s/AKfycbxdz6mBmlbqFZk8Xv36MAHaglAn6-VY78Hr03RaPPB2E2qN4vsEZHSgGT1-HDCxUuB1Dw/exec';
 
   if(!/^https:\/\/script\.google\.com\/(a\/[^\/]+\/)?macros\/s\/[A-Za-z0-9_-]{20,}\/exec$/.test(WEB_APP_URL)){
     document.body.innerHTML='<div class="msg"><b>Chưa cấu hình WEB_APP_URL.</b><br>Mở file <code>index.html</code>, dán URL Web App thật (dạng <code>https://script.google.com/macros/s/.../exec</code>) vào dòng <code>var WEB_APP_URL=\'\';</code>.</div>';
