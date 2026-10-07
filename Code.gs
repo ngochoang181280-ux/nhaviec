@@ -39,6 +39,28 @@ function doGet() {
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
+/**
+ * CỔNG API CHO GITHUB PAGES (giao diện đặt ngoài Apps Script gọi bằng fetch POST).
+ * Chỉ cho phép 3 lệnh: login, logout, api. Mọi nghiệp vụ khác vẫn đi qua api() có kiểm tra phiên.
+ * Body gửi lên: {"fn":"login|logout|api","args":[...]}
+ */
+function doPost(e) {
+  let out;
+  try {
+    const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    const args = Array.isArray(body.args) ? body.args : [];
+    let result;
+    if (body.fn === 'login') result = login.apply(null, args);
+    else if (body.fn === 'logout') result = logout.apply(null, args);
+    else if (body.fn === 'api') result = api.apply(null, args);
+    else throw new Error('Chức năng không hợp lệ.');
+    out = { ok: true, data: result === undefined ? null : result };
+  } catch (err) {
+    out = { ok: false, error: (err && err.message) ? err.message : String(err) };
+  }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
 // Dán ID của Google Sheet dữ liệu vào đây nếu script KHÔNG được tạo từ trong Sheet.
 // ID là đoạn giữa /d/ và /edit trong link Sheet: https://docs.google.com/spreadsheets/d/<ID>/edit
 const SPREADSHEET_ID = '';
