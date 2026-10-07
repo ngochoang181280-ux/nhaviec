@@ -370,11 +370,25 @@ function deleteRecord(type, id) {
   const sheet = type === 'DEN' ? APP.SHEETS.INCOMING : APP.SHEETS.OUTGOING;
   const r = readObjects_(sheet).find(x => String(x.ID) === String(id));
   if (!r) throw new Error('Không tìm thấy văn bản.');
+
+  // Xóa file đính kèm trong Drive (chuyển vào Thùng rác của Drive, giữ được 30 ngày)
+  let fileMsg = 'không có file đính kèm';
+  if (r.FILE_ID) {
+    try {
+      DriveApp.getFileById(String(r.FILE_ID)).setTrashed(true);
+      fileMsg = 'đã xóa file "' + r.FILE_NAME + '" trong Drive';
+    } catch (e) {
+      fileMsg = 'KHÔNG xóa được file trong Drive (' + (e && e.message ? e.message : e) + ')';
+    }
+  }
+  const oldName = r.FILE_NAME;
   r.ACTIVE = 'DELETED';
+  r.FILE_ID = ''; r.FILE_NAME = ''; r.FILE_URL = '';
   r.NGAY_CAP_NHAT = now_();
   upsertObject_(sheet, r);
-  audit_('DELETE', type, id, r.SO_VAN_BAN);
-  return {ok:true};
+  appendHistory_(id, type === 'DEN' ? 'VĂN BẢN ĐẾN' : 'VĂN BẢN ĐI', 'XÓA', 'Xóa văn bản; ' + fileMsg);
+  audit_('DELETE', type, id, (r.SO_VAN_BAN || '') + ' | ' + fileMsg);
+  return {ok:true, fileDeleted: !!oldName && fileMsg.indexOf('KHÔNG') < 0, message: 'Đã xóa văn bản; ' + fileMsg + '.'};
 }
 
 /* =========================
@@ -683,11 +697,10 @@ function alreadyLogged_(logs, id, email, type, slotKey, result) {
 ========================= */
 
 /**
- * Lấy nội dung file đính kèm cho giao diện.
- * preview=true: Word/Excel/PowerPoint/... được chuyển sang PDF để xem ngay trong trình duyệt
- * (dùng Drive REST API, không cần bật dịch vụ nâng cao).
+ * Lấy nội dung file đính kèm cho giao diện (xem trước / tải về).
+ * Việc hiển thị Word, Excel, PowerPoint do trình duyệt đảm nhiệm, máy chủ chỉ trả dữ liệu file.
  */
-function getFileData(fileId, preview) {
+function getFileData(fileId) {
   requireLogin_();
   if (!fileId) throw new Error('Thiếu file ID.');
   const known = readObjects_(APP.SHEETS.INCOMING).concat(readObjects_(APP.SHEETS.OUTGOING))
@@ -695,30 +708,11 @@ function getFileData(fileId, preview) {
   if (!known) throw new Error('File không thuộc hệ thống.');
   const file = DriveApp.getFileById(fileId);
   if (file.getSize() > APP.MAX_UPLOAD_MB * 1024 * 1024) throw new Error('File quá lớn để xem trực tiếp.');
-
-  let blob = file.getBlob();
+  const blob = file.getBlob();
   const name = file.getName();
-  let mime = guessMime_(blob.getContentType(), name);
-  let converted = false, note = '';
-
-  if (preview) {
-    const target = officeTargetType_(mime);
-    if (target) {
-      try {
-        blob = convertToPdf_(file, target);
-        mime = 'application/pdf';
-        converted = true;
-      } catch (e) {
-        note = 'Không chuyển được sang PDF để xem trước: ' + (e && e.message ? e.message : e);
-        if (/external_request|UrlFetchApp|permission/i.test(String(note))) {
-          note += ' (Hãy chạy lại một hàm bất kỳ trong Apps Script, bấm Allow để cấp quyền mới, rồi Deploy phiên bản mới.)';
-        }
-      }
-    }
-  }
   return {
-    id:file.getId(), name:name, mimeType:mime, size:file.getSize(),
-    base64:Utilities.base64Encode(blob.getBytes()), converted:converted, note:note
+    id:file.getId(), name:name, mimeType:guessMime_(blob.getContentType(), name), size:file.getSize(),
+    base64:Utilities.base64Encode(blob.getBytes()), converted:false, note:''
   };
 }
 
@@ -736,57 +730,6 @@ function guessMime_(mime, name) {
     odp:'application/vnd.oasis.opendocument.presentation'
   };
   return map[ext] || m || 'application/octet-stream';
-}
-
-/** Trả về loại Google tương ứng để chuyển đổi, hoặc null nếu không cần/không chuyển được. */
-function officeTargetType_(mime) {
-  const DOC = 'application/vnd.google-apps.document';
-  const SHEET = 'application/vnd.google-apps.spreadsheet';
-  const SLIDE = 'application/vnd.google-apps.presentation';
-  const t = {
-    'application/msword':DOC, 'application/rtf':DOC, 'text/rtf':DOC, 'application/vnd.oasis.opendocument.text':DOC,
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document':DOC,
-    'application/vnd.ms-excel':SHEET, 'application/vnd.oasis.opendocument.spreadsheet':SHEET,
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':SHEET,
-    'application/vnd.ms-powerpoint':SLIDE, 'application/vnd.oasis.opendocument.presentation':SLIDE,
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation':SLIDE,
-    'text/html':DOC
-  };
-  return t[mime] || null;
-}
-
-/**
- * Chuyển file Office sang PDF qua bản tạm trong Drive (xóa ngay sau khi xong).
- * Gọi thẳng Drive REST API bằng UrlFetchApp nên KHÔNG cần bật dịch vụ nâng cao Drive.
- */
-function convertToPdf_(file, targetType) {
-  const src = file.getBlob();
-  const srcMime = guessMime_(src.getContentType(), file.getName());
-  const boundary = 'qlvb' + Utilities.getUuid().replace(/-/g, '');
-  const meta = JSON.stringify({ name: 'tmp_preview_' + Date.now(), mimeType: targetType });
-  const head = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + meta +
-    '\r\n--' + boundary + '\r\nContent-Type: ' + srcMime + '\r\n\r\n';
-  const tail = '\r\n--' + boundary + '--';
-  const payload = Utilities.newBlob(head).getBytes()
-    .concat(src.getBytes())
-    .concat(Utilities.newBlob(tail).getBytes());
-
-  const res = UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
-    method: 'post',
-    contentType: 'multipart/related; boundary=' + boundary,
-    payload: payload,
-    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-    muteHttpExceptions: true
-  });
-  if (res.getResponseCode() >= 300) {
-    throw new Error('Drive trả về lỗi ' + res.getResponseCode() + ': ' + String(res.getContentText()).substring(0, 200));
-  }
-  const tmpId = JSON.parse(res.getContentText()).id;
-  try {
-    return DriveApp.getFileById(tmpId).getBlob().getAs('application/pdf');
-  } finally {
-    try { DriveApp.getFileById(tmpId).setTrashed(true); } catch (e) {}
-  }
 }
 
 function saveUploadedFile_(fileObj, type) {
