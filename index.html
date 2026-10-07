@@ -252,15 +252,390 @@
 </div>
 
 <script>
+/* ===================================================================
+ * BẢN ĐỘC LẬP: toàn bộ dữ liệu lưu ngay trong trình duyệt (IndexedDB).
+ * Không cần Apps Script / Google Sheet. Dữ liệu chỉ nằm trên máy + trình duyệt này,
+ * vì vậy hãy dùng nút "Sao lưu" thường xuyên.
+ * =================================================================== */
+var LocalBackend=(function(){
+  var DB_NAME='qlvb_standalone',MAX_UPLOAD_MB=15,SESSION_KEY='qlvb_local_sess';
+  var idb=null,db=null,files={};
+  var ROLES=['ADMIN','QUAN_LY','NHAN_VIEN','CHI_XEM'];
+  var DEFAULT_CONFIG={APP_NAME:'QUẢN LÝ VĂN BẢN',EMAIL_ENABLED:'FALSE',REMIND_BEFORE_DAYS:'3',SEND_TIMES:'08:00,15:00',REMIND_DUE_TODAY:'TRUE',OVERDUE_DAYS:'MOI_NGAY',MAX_EMAILS_PER_RUN:'50',ROOT_FOLDER_ID:'',LAST_REMINDER_RUN:''};
+  var CATS={LOAI_VAN_BAN:['Thông tư','Nghị định','Quyết định','Quy trình','Nội quy','Quy chế','Công văn','Thông báo','Hướng dẫn','Kế hoạch','Biên bản','Báo cáo','Tờ trình'],
+    TINH_TRANG:['Chưa xử lý','Đang xử lý','Chờ phối hợp','Chờ phê duyệt','Đã hoàn thành','Lưu trữ'],
+    MUC_DO:['Bình thường','Quan trọng','Khẩn','Rất khẩn']};
+  var cur=null; // người dùng đang thực thi lệnh
+
+  /* ---------- IndexedDB ---------- */
+  function openIdb(){
+    return new Promise(function(res,rej){
+      if(!window.indexedDB)return rej(new Error('Trình duyệt không hỗ trợ lưu trữ cục bộ (IndexedDB). Hãy dùng Chrome/Edge/Firefox bản mới.'));
+      var r=indexedDB.open(DB_NAME,1);
+      r.onupgradeneeded=function(){var d=r.result;d.createObjectStore('kv');d.createObjectStore('files')};
+      r.onsuccess=function(){res(r.result)};
+      r.onerror=function(){rej(new Error('Không mở được kho dữ liệu của trình duyệt (có thể đang ở chế độ ẩn danh).'))};
+    });
+  }
+  function idbGet(store,key){return new Promise(function(res,rej){var q=idb.transaction(store).objectStore(store).get(key);q.onsuccess=function(){res(q.result)};q.onerror=function(){rej(q.error)}})}
+  function idbPut(store,key,val){return new Promise(function(res,rej){var t=idb.transaction(store,'readwrite');t.objectStore(store).put(val,key);t.oncomplete=function(){res()};t.onerror=function(){rej(t.error)}})}
+  function idbDel(store,key){return new Promise(function(res,rej){var t=idb.transaction(store,'readwrite');t.objectStore(store).delete(key);t.oncomplete=function(){res()};t.onerror=function(){rej(t.error)}})}
+  function idbAllKeys(store){return new Promise(function(res,rej){var q=idb.transaction(store).objectStore(store).getAllKeys();q.onsuccess=function(){res(q.result)};q.onerror=function(){rej(q.error)}})}
+  function newDb(){
+    var cats=[],n=0;
+    Object.keys(CATS).forEach(function(g,gi){CATS[g].forEach(function(v,i){cats.push({ID:String(++n),NHOM:g,GIA_TRI:v,TRANG_THAI:'Đang dùng',THU_TU:String(i+1)})})});
+    return {config:Object.assign({},DEFAULT_CONFIG),users:[],categories:cats,handlers:[],incoming:[],outgoing:[],history:[],emailLog:[],audit:[]};
+  }
+  async function init(){
+    if(db)return;
+    idb=await openIdb();
+    db=await idbGet('kv','db');
+    if(!db){db=newDb();await save()}
+  }
+  function save(){return idbPut('kv','db',db)}
+
+  /* ---------- Tiện ích ---------- */
+  function pad(n){return (n<10?'0':'')+n}
+  function nowStr(){var d=new Date();return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
+  function uid(){if(window.crypto&&crypto.randomUUID)return crypto.randomUUID();return 'id'+Date.now().toString(36)+Math.random().toString(36).slice(2,10)}
+  function clean(v){return v===null||v===undefined?'':String(v).trim()}
+  function norm(v){return clean(v).toLowerCase()}
+  function required(o,fs){fs.forEach(function(f){if(o[f]===undefined||o[f]===null||String(o[f]).trim()==='')throw new Error('Thiếu trường bắt buộc: '+f)})}
+  function parseDate(v){if(!v)return null;var s=String(v).trim();var m=s.match(/^(\d{4})-(\d{2})-(\d{2})/);if(m)return new Date(+m[1],+m[2]-1,+m[3]);var d=new Date(s);return isNaN(d.getTime())?null:d}
+  function strip(d){var x=new Date(d);x.setHours(0,0,0,0);return x}
+  function daysBetween(a,b){return Math.round((strip(b)-strip(a))/86400000)}
+  function cfg(k){var v=db.config[k];return v===undefined?'':v}
+  function before(){return Number(cfg('REMIND_BEFORE_DAYS')||3)}
+  function calcDue(dv,status){
+    if(!dv)return 'Không có hạn';
+    if(['Đã hoàn thành','Lưu trữ'].indexOf(String(status))>=0)return 'Đã đóng';
+    var d=parseDate(dv);if(!d)return 'Không có hạn';
+    var diff=daysBetween(new Date(),d);
+    if(diff<0)return 'Quá hạn';if(diff===0)return 'Đến hạn hôm nay';if(diff<=before())return 'Sắp đến hạn';return 'Chưa đến hạn';
+  }
+  function isActive(r){var v=(r.ACTIVE===''||r.ACTIVE===null||r.ACTIVE===undefined)?'TRUE':r.ACTIVE;return String(v).toUpperCase()==='TRUE'}
+  function nextStt(list){return list.reduce(function(m,r){return Math.max(m,Number(r.STT)||0)},0)+1}
+  function publicUser(u){var o=Object.assign({},u);delete o.MAT_KHAU_HASH;delete o.SALT;o.VAI_TRO=String(o.VAI_TRO||'').toUpperCase();return o}
+  function isUserActive(u){return String(u.TRANG_THAI||'').normalize('NFC').trim().toLowerCase()==='đang hoạt động'}
+  function isAdmin(u){return String(u.VAI_TRO).toUpperCase()==='ADMIN'}
+  function upsert(list,obj){var i=list.findIndex(function(r){return String(r.ID)===String(obj.ID)});if(i>=0)list[i]=obj;else list.push(obj)}
+  function history(id,type,action,content){db.history.push({ID:uid(),VAN_BAN_ID:id,LOAI_VAN_BAN:type,THOI_GIAN:nowStr(),NGUOI_THUC_HIEN:cur?cur.EMAIL:'',HANH_DONG:action,NOI_DUNG:content})}
+  function audit(action,type,id,detail){db.audit.push({ID:uid(),THOI_GIAN:nowStr(),EMAIL:cur?cur.EMAIL:'',HANH_DONG:action,DOI_TUONG:type,DOI_TUONG_ID:id,CHI_TIET:detail});if(db.audit.length>2000)db.audit=db.audit.slice(-1000)}
+  function perm(roles){if(!cur)throw new Error('PHIEN_HET_HAN');var r=String(cur.VAI_TRO).toUpperCase();if(roles.indexOf(r)<0)throw new Error('Bạn không có quyền thực hiện thao tác này.');return cur}
+  function handlerIdByEmail(email){var h=db.handlers.find(function(x){return norm(x.EMAIL)===norm(email)});return h?String(h.ID):''}
+  function canEdit(r,u){
+    var role=String(u.VAI_TRO).toUpperCase();
+    if(role==='ADMIN'||role==='QUAN_LY')return true;
+    if(role==='NHAN_VIEN'){var hid=handlerIdByEmail(u.EMAIL);return norm(r.NGUOI_NHAP)===norm(u.EMAIL)||String(r.NGUOI_CHU_TRI_ID)===hid||String(r.NGUOI_SOAN_ID)===hid}
+    return false;
+  }
+  function syncHandler(u){
+    var ex=db.handlers.find(function(h){return norm(h.EMAIL)===norm(u.EMAIL)});
+    upsert(db.handlers,{ID:ex?ex.ID:uid(),HO_TEN:u.HO_TEN,EMAIL:u.EMAIL,BO_PHAN:u.BO_PHAN,TRANG_THAI:String(u.TRANG_THAI)==='Đang hoạt động'?'Đang hoạt động':'Ngừng sử dụng',NGAY_TAO:ex?ex.NGAY_TAO:nowStr()});
+  }
+  function categories(){
+    var out={LOAI_VAN_BAN:[],TINH_TRANG:[],MUC_DO:[]};
+    db.categories.filter(function(r){return String(r.TRANG_THAI)!=='Ngừng dùng'}).sort(function(a,b){return Number(a.THU_TU||99)-Number(b.THU_TU||99)})
+      .forEach(function(r){if(out[r.NHOM])out[r.NHOM].push(r.GIA_TRI)});
+    return out;
+  }
+
+  /* ---------- Mật khẩu ---------- */
+  async function hashPw(pw,salt){
+    if(!(window.crypto&&crypto.subtle))throw new Error('Trình duyệt cần mở trang bằng https:// (GitHub Pages) để băm mật khẩu an toàn.');
+    var enc=new TextEncoder(),h=salt+':'+pw;
+    for(var i=0;i<300;i++){
+      var buf=await crypto.subtle.digest('SHA-256',enc.encode(h+salt));
+      h=btoa(String.fromCharCode.apply(null,new Uint8Array(buf)));
+    }
+    return h;
+  }
+  async function setPw(row,pw){row.SALT=uid().replace(/-/g,'');row.MAT_KHAU_HASH=await hashPw(pw,row.SALT)}
+
+  /* ---------- Phiên đăng nhập ---------- */
+  function sessions(){try{return JSON.parse(sessionStorage.getItem(SESSION_KEY)||'{}')}catch(e){return {}}}
+  function putSessions(s){try{sessionStorage.setItem(SESSION_KEY,JSON.stringify(s))}catch(e){}}
+  function failState(){try{return JSON.parse(localStorage.getItem('qlvb_fail')||'{}')}catch(e){return {}}}
+  function putFail(f){try{localStorage.setItem('qlvb_fail',JSON.stringify(f))}catch(e){}}
+
+  async function login(username,password){
+    await init();
+    var name=norm(username),pw=String(password||'');
+    if(!name||!pw)throw new Error('Nhập tên đăng nhập và mật khẩu.');
+    var f=failState(),rec=f[name];
+    if(rec&&rec.n>=5&&Date.now()-rec.t<600000)throw new Error('Đăng nhập sai quá nhiều lần. Thử lại sau 10 phút.');
+    var u;
+    if(!db.users.length){
+      // Lần đầu sử dụng: tài khoản đầu tiên trở thành quản trị viên
+      if(!/^[a-z0-9._-]{3,30}$/.test(name))throw new Error('Lần đầu sử dụng: tên đăng nhập gồm 3-30 ký tự, chữ không dấu, số, dấu . _ -');
+      if(pw.length<6)throw new Error('Lần đầu sử dụng: mật khẩu tối thiểu 6 ký tự.');
+      u={ID:uid(),HO_TEN:name,EMAIL:name+'@local',BO_PHAN:'Quản trị',VAI_TRO:'ADMIN',TRANG_THAI:'Đang hoạt động',NGAY_TAO:nowStr(),TEN_DANG_NHAP:name};
+      await setPw(u,pw);db.users.push(u);syncHandler(u);
+    }else{
+      u=db.users.find(function(x){return norm(x.TEN_DANG_NHAP)===name||(name.indexOf('@')>0&&norm(x.EMAIL)===name)});
+      var ok=u&&u.MAT_KHAU_HASH&&u.SALT&&(await hashPw(pw,String(u.SALT)))===String(u.MAT_KHAU_HASH);
+      if(!ok){var r=(rec&&Date.now()-rec.t<600000)?rec:{n:0};r.n++;r.t=Date.now();f[name]=r;putFail(f);throw new Error('Sai tên đăng nhập hoặc mật khẩu.')}
+      if(!isUserActive(u))throw new Error('Tài khoản đã bị khóa. Liên hệ quản trị viên.');
+    }
+    delete f[name];putFail(f);
+    var token=uid().replace(/-/g,'')+uid().replace(/-/g,'');
+    var s=sessions();s[token]=String(u.ID);putSessions(s);
+    cur=publicUser(u);
+    audit('LOGIN','TÀI KHOẢN',u.ID,u.TEN_DANG_NHAP);
+    await save();
+    return {token:token};
+  }
+  async function logout(token){var s=sessions();if(token)delete s[token];putSessions(s);cur=null;return {ok:true}}
+  async function changePassword(oldPw,newPw){
+    newPw=String(newPw||'');
+    if(newPw.length<6)throw new Error('Mật khẩu mới tối thiểu 6 ký tự.');
+    var row=db.users.find(function(x){return String(x.ID)===String(cur.ID)});
+    if(!row||(await hashPw(String(oldPw||''),String(row.SALT)))!==String(row.MAT_KHAU_HASH))throw new Error('Mật khẩu hiện tại không đúng.');
+    await setPw(row,newPw);audit('CHANGE_PASSWORD','TÀI KHOẢN',row.ID,row.TEN_DANG_NHAP);
+    return 'Đã đổi mật khẩu.';
+  }
+
+  /* ---------- Nghiệp vụ ---------- */
+  function buildStats(inc,out){
+    var today=new Date(),b=before(),closed=['Đã hoàn thành','Lưu trữ'];
+    var s={totalIncoming:inc.length,totalOutgoing:out.length,processing:0,dueSoon:0,dueToday:0,overdue:0,completed:0,archived:0,noDueDate:0};
+    inc.forEach(function(r){
+      var st=String(r.TINH_TRANG||'');
+      if(['Đang xử lý','Chưa xử lý','Chờ phối hợp','Chờ phê duyệt'].indexOf(st)>=0)s.processing++;
+      if(st==='Đã hoàn thành')s.completed++;
+      if(st==='Lưu trữ')s.archived++;
+      var d=parseDate(r.HAN_XU_LY);
+      if(!d){s.noDueDate++;return}
+      if(closed.indexOf(st)>=0)return;
+      var diff=daysBetween(today,d);
+      if(diff<0)s.overdue++;else if(diff===0)s.dueToday++;else if(diff<=b)s.dueSoon++;
+    });
+    return s;
+  }
+  function enrichIn(rows){
+    var map={};db.handlers.forEach(function(h){map[h.ID]=h});
+    return rows.map(function(r){
+      var o=Object.assign({},r),m=map[r.NGUOI_CHU_TRI_ID];
+      o.NGUOI_CHU_TRI_TEN=m?m.HO_TEN:'';o.NGUOI_CHU_TRI_EMAIL=m?m.EMAIL:'';
+      var ids=String(r.NGUOI_PHU_HOP_ID||'').split(',').map(function(x){return x.trim()});
+      o.NGUOI_PHU_HOP_TEN=ids.map(function(i){return map[i]?map[i].HO_TEN:''}).filter(Boolean).join(', ');
+      o.NGUOI_PHU_HOP_EMAIL=ids.map(function(i){return map[i]?map[i].EMAIL:''}).filter(Boolean).join(', ');
+      o.TRANG_THAI_HAN=calcDue(r.HAN_XU_LY,r.TINH_TRANG);
+      return o;
+    });
+  }
+  function enrichOut(rows){
+    var map={};db.handlers.forEach(function(h){map[h.ID]=h});
+    return rows.map(function(r){var o=Object.assign({},r),p=map[r.NGUOI_SOAN_ID];o.NGUOI_SOAN_TEN=p?p.HO_TEN:'';return o});
+  }
+  function guessMime(mime,name){
+    var m=String(mime||'').toLowerCase();if(m&&m!=='application/octet-stream')return m;
+    var ext=String(name||'').toLowerCase().split('.').pop();
+    var map={pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',bmp:'image/bmp',txt:'text/plain',csv:'text/csv',html:'text/html',rtf:'application/rtf',doc:'application/msword',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',xls:'application/vnd.ms-excel',xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',ppt:'application/vnd.ms-powerpoint',pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',odt:'application/vnd.oasis.opendocument.text',ods:'application/vnd.oasis.opendocument.spreadsheet',odp:'application/vnd.oasis.opendocument.presentation'};
+    return map[ext]||m||'application/octet-stream';
+  }
+  async function saveFile(fo){
+    var b64=String(fo.base64).split(',').pop();
+    var bytes=Math.floor(b64.length*3/4);
+    if(bytes/1024/1024>MAX_UPLOAD_MB)throw new Error('File vượt quá '+MAX_UPLOAD_MB+' MB.');
+    var id=uid(),name=fo.name||('file_'+Date.now());
+    var rec={name:name,mimeType:guessMime(fo.mimeType,name),size:bytes,base64:b64};
+    await idbPut('files',id,rec);
+    return {id:id,name:name,url:''};
+  }
+
+  var API={
+    getAppData:async function(){
+      var user=cur;
+      var incAll=db.incoming,inc=incAll.filter(isActive),out=db.outgoing.filter(isActive);
+      var stats=buildStats(inc,out);
+      stats.archived=incAll.filter(function(r){return String(r.ACTIVE).toUpperCase()==='FALSE'||String(r.TINH_TRANG)==='Lưu trữ'}).length;
+      return {user:user,config:Object.assign({},db.config),categories:categories(),
+        handlers:db.handlers.filter(function(r){return String(r.TRANG_THAI)!=='Ngừng sử dụng'}),
+        users:isAdmin(user)?db.users.map(publicUser):[],
+        incoming:enrichIn(inc),outgoing:enrichOut(out),
+        history:db.history.slice(-200).reverse(),
+        emailLog:isAdmin(user)?db.emailLog.slice(-200).reverse():[],
+        stats:stats,triggerCount:0};
+    },
+    saveIncoming:async function(p){
+      perm(['ADMIN','QUAN_LY','NHAN_VIEN']);p=p||{};
+      required(p,['SO_VAN_BAN','NGAY_VAN_BAN','TEN_VAN_BAN','TRICH_YEU','NGUOI_CHU_TRI_ID']);
+      var id=p.ID||uid(),ex=db.incoming.find(function(r){return String(r.ID)===String(id)});
+      if(ex&&!canEdit(ex,cur))throw new Error('Bạn không có quyền sửa văn bản này.');
+      var file=p.FILE&&p.FILE.base64?await saveFile(p.FILE):null;
+      var status=p.TINH_TRANG||'Chưa xử lý',now=nowStr();
+      var row={ID:id,STT:ex?ex.STT:nextStt(db.incoming),SO_VAN_BAN:clean(p.SO_VAN_BAN),NGAY_VAN_BAN:p.NGAY_VAN_BAN,NGAY_NHAN:p.NGAY_NHAN||'',
+        LOAI_VAN_BAN:clean(p.LOAI_VAN_BAN),CO_QUAN_BAN_HANH:clean(p.CO_QUAN_BAN_HANH),TEN_VAN_BAN:clean(p.TEN_VAN_BAN),TRICH_YEU:clean(p.TRICH_YEU),
+        NGUOI_CHU_TRI_ID:clean(p.NGUOI_CHU_TRI_ID),NGUOI_PHU_HOP_ID:Array.isArray(p.NGUOI_PHU_HOP_ID)?p.NGUOI_PHU_HOP_ID.join(','):clean(p.NGUOI_PHU_HOP_ID),
+        BO_PHAN:clean(p.BO_PHAN),MUC_DO:clean(p.MUC_DO),HAN_XU_LY:p.HAN_XU_LY||'',TINH_TRANG:status,TIEN_DO:Number(p.TIEN_DO||0),
+        TRANG_THAI_HAN:calcDue(p.HAN_XU_LY,status),GHI_CHU:clean(p.GHI_CHU),
+        FILE_ID:file?file.id:(ex?ex.FILE_ID:''),FILE_NAME:file?file.name:(ex?ex.FILE_NAME:''),FILE_URL:'',
+        NGUOI_NHAP:ex?ex.NGUOI_NHAP:cur.EMAIL,NGAY_NHAP:ex?ex.NGAY_NHAP:now,NGAY_CAP_NHAT:now,ACTIVE:'TRUE'};
+      if(file&&ex&&ex.FILE_ID)await idbDel('files',ex.FILE_ID);
+      upsert(db.incoming,row);
+      history(id,'VĂN BẢN ĐẾN',ex?'CẬP NHẬT':'TẠO MỚI',ex?'Cập nhật thông tin văn bản':'Tạo văn bản mới');
+      audit(ex?'UPDATE_INCOMING':'CREATE_INCOMING','VĂN BẢN ĐẾN',id,row.SO_VAN_BAN);
+      return {ok:true,id:id};
+    },
+    saveOutgoing:async function(p){
+      perm(['ADMIN','QUAN_LY','NHAN_VIEN']);p=p||{};
+      required(p,['SO_VAN_BAN','NGAY_VAN_BAN','TEN_VAN_BAN','TRICH_YEU']);
+      var id=p.ID||uid(),ex=db.outgoing.find(function(r){return String(r.ID)===String(id)});
+      if(ex&&!canEdit(ex,cur))throw new Error('Bạn không có quyền sửa văn bản này.');
+      var file=p.FILE&&p.FILE.base64?await saveFile(p.FILE):null,now=nowStr();
+      var row={ID:id,STT:ex?ex.STT:nextStt(db.outgoing),SO_VAN_BAN:clean(p.SO_VAN_BAN),NGAY_VAN_BAN:p.NGAY_VAN_BAN,LOAI_VAN_BAN:clean(p.LOAI_VAN_BAN),
+        NOI_NHAN:clean(p.NOI_NHAN),TEN_VAN_BAN:clean(p.TEN_VAN_BAN),TRICH_YEU:clean(p.TRICH_YEU),NGUOI_SOAN_ID:clean(p.NGUOI_SOAN_ID),
+        TINH_TRANG:p.TINH_TRANG||'Đang xử lý',FILE_ID:file?file.id:(ex?ex.FILE_ID:''),FILE_NAME:file?file.name:(ex?ex.FILE_NAME:''),FILE_URL:'',
+        GHI_CHU:clean(p.GHI_CHU),NGUOI_NHAP:ex?ex.NGUOI_NHAP:cur.EMAIL,NGAY_NHAP:ex?ex.NGAY_NHAP:now,NGAY_CAP_NHAT:now,ACTIVE:'TRUE'};
+      if(file&&ex&&ex.FILE_ID)await idbDel('files',ex.FILE_ID);
+      upsert(db.outgoing,row);
+      history(id,'VĂN BẢN ĐI',ex?'CẬP NHẬT':'TẠO MỚI',ex?'Cập nhật thông tin văn bản':'Tạo văn bản mới');
+      audit(ex?'UPDATE_OUTGOING':'CREATE_OUTGOING','VĂN BẢN ĐI',id,row.SO_VAN_BAN);
+      return {ok:true,id:id};
+    },
+    completeRecord:async function(type,id){
+      perm(['ADMIN','QUAN_LY','NHAN_VIEN']);
+      var list=type==='DEN'?db.incoming:db.outgoing,r=list.find(function(x){return String(x.ID)===String(id)});
+      if(!r)throw new Error('Không tìm thấy văn bản.');
+      if(!canEdit(r,cur))throw new Error('Bạn không có quyền hoàn thành văn bản này.');
+      if(String(r.TINH_TRANG)==='Đã hoàn thành')return {ok:true};
+      r.TINH_TRANG='Đã hoàn thành';if(type==='DEN')r.TIEN_DO=100;r.NGAY_CAP_NHAT=nowStr();
+      history(id,type==='DEN'?'VĂN BẢN ĐẾN':'VĂN BẢN ĐI','HOÀN THÀNH','Đánh dấu đã hoàn thành');audit('COMPLETE',type,id,r.SO_VAN_BAN);
+      return {ok:true};
+    },
+    addNote:async function(type,id,text){
+      perm(['ADMIN','QUAN_LY','NHAN_VIEN']);
+      text=String(text||'').trim();
+      if(!text)throw new Error('Nhập nội dung ghi chú.');
+      if(text.length>1000)throw new Error('Ghi chú tối đa 1000 ký tự.');
+      var list=type==='DEN'?db.incoming:db.outgoing;
+      if(!list.some(function(x){return String(x.ID)===String(id)}))throw new Error('Không tìm thấy văn bản.');
+      history(id,type==='DEN'?'VĂN BẢN ĐẾN':'VĂN BẢN ĐI','GHI CHÚ',text);
+      return {ok:true};
+    },
+    archiveRecord:async function(type,id){
+      perm(['ADMIN','QUAN_LY']);
+      var list=type==='DEN'?db.incoming:db.outgoing,r=list.find(function(x){return String(x.ID)===String(id)});
+      if(!r)throw new Error('Không tìm thấy văn bản.');
+      r.ACTIVE='FALSE';r.TINH_TRANG='Lưu trữ';r.NGAY_CAP_NHAT=nowStr();
+      history(id,type==='DEN'?'VĂN BẢN ĐẾN':'VĂN BẢN ĐI','LƯU TRỮ','Đưa văn bản vào lưu trữ');audit('ARCHIVE',type,id,r.SO_VAN_BAN);
+      return {ok:true};
+    },
+    deleteRecord:async function(type,id){
+      perm(['ADMIN']);
+      var list=type==='DEN'?db.incoming:db.outgoing,r=list.find(function(x){return String(x.ID)===String(id)});
+      if(!r)throw new Error('Không tìm thấy văn bản.');
+      var msg='không có file đính kèm',had=!!r.FILE_NAME;
+      if(r.FILE_ID){try{await idbDel('files',String(r.FILE_ID));msg='đã xóa file "'+r.FILE_NAME+'"'}catch(e){msg='KHÔNG xóa được file ('+(e&&e.message||e)+')'}}
+      r.ACTIVE='DELETED';r.FILE_ID='';r.FILE_NAME='';r.FILE_URL='';r.NGAY_CAP_NHAT=nowStr();
+      history(id,type==='DEN'?'VĂN BẢN ĐẾN':'VĂN BẢN ĐI','XÓA','Xóa văn bản; '+msg);audit('DELETE',type,id,(r.SO_VAN_BAN||'')+' | '+msg);
+      return {ok:true,fileDeleted:had&&msg.indexOf('KHÔNG')<0,message:'Đã xóa văn bản; '+msg+'.'};
+    },
+    saveUser:async function(p){
+      var me=perm(['ADMIN']);p=p||{};
+      required(p,['HO_TEN','EMAIL','VAI_TRO','TEN_DANG_NHAP']);
+      var username=norm(p.TEN_DANG_NHAP);
+      if(!/^[a-z0-9._-]{3,30}$/.test(username))throw new Error('Tên đăng nhập gồm 3-30 ký tự: chữ không dấu, số, dấu . _ -');
+      var role=clean(p.VAI_TRO).toUpperCase();
+      if(ROLES.indexOf(role)<0)throw new Error('Vai trò không hợp lệ.');
+      var id=p.ID||uid(),ex=db.users.find(function(r){return String(r.ID)===String(id)});
+      if(db.users.some(function(r){return String(r.ID)!==String(id)&&norm(r.TEN_DANG_NHAP)===username}))throw new Error('Tên đăng nhập "'+username+'" đã tồn tại.');
+      var status=p.TRANG_THAI||'Đang hoạt động';
+      if(String(id)===String(me.ID)&&(role!=='ADMIN'||status!=='Đang hoạt động'))throw new Error('Không thể tự hạ quyền hoặc khóa chính tài khoản đang đăng nhập.');
+      var row=Object.assign({},ex||{},{ID:id,HO_TEN:clean(p.HO_TEN),EMAIL:clean(p.EMAIL).toLowerCase(),BO_PHAN:clean(p.BO_PHAN),VAI_TRO:role,TRANG_THAI:status,TEN_DANG_NHAP:username,NGAY_TAO:ex?ex.NGAY_TAO:nowStr()});
+      var pw=String(p.MAT_KHAU||'');
+      if(pw){if(pw.length<6)throw new Error('Mật khẩu tối thiểu 6 ký tự.');await setPw(row,pw)}
+      else if(!ex||!row.MAT_KHAU_HASH)throw new Error('Tài khoản mới phải có mật khẩu (tối thiểu 6 ký tự).');
+      upsert(db.users,row);syncHandler(row);audit('SAVE_USER','NGƯỜI DÙNG',id,username+' / '+role);
+      return {ok:true};
+    },
+    saveHandler:async function(p){
+      perm(['ADMIN']);p=p||{};required(p,['HO_TEN','EMAIL']);
+      var id=p.ID||uid();
+      var row={ID:id,HO_TEN:clean(p.HO_TEN),EMAIL:clean(p.EMAIL).toLowerCase(),BO_PHAN:clean(p.BO_PHAN),TRANG_THAI:p.TRANG_THAI||'Đang hoạt động',NGAY_TAO:p.NGAY_TAO||nowStr()};
+      upsert(db.handlers,row);audit('SAVE_HANDLER','NGƯỜI XỬ LÝ',id,row.EMAIL);
+      return {ok:true};
+    },
+    saveCategory:async function(p){
+      perm(['ADMIN']);p=p||{};required(p,['NHOM','GIA_TRI']);
+      var id=p.ID||uid();
+      var row={ID:id,NHOM:clean(p.NHOM),GIA_TRI:clean(p.GIA_TRI),TRANG_THAI:p.TRANG_THAI||'Đang dùng',THU_TU:p.THU_TU||99};
+      upsert(db.categories,row);audit('SAVE_CATEGORY','DANH MỤC',id,row.NHOM+': '+row.GIA_TRI);
+      return {ok:true};
+    },
+    saveConfig:async function(p){
+      perm(['ADMIN']);p=p||{};
+      ['EMAIL_ENABLED','REMIND_BEFORE_DAYS','SEND_TIMES','REMIND_DUE_TODAY','OVERDUE_DAYS','MAX_EMAILS_PER_RUN'].forEach(function(k){if(p[k]!==undefined)db.config[k]=String(p[k])});
+      audit('SAVE_CONFIG','CẤU HÌNH','EMAIL','Cập nhật cấu hình nhắc việc');
+      return Object.assign({},db.config);
+    },
+    sendTestEmail:async function(){perm(['ADMIN']);return 'Bản chạy độc lập trên GitHub không gửi được email.'},
+    runReminderNow:async function(){
+      perm(['ADMIN']);
+      var inc=db.incoming.filter(isActive),c={q:0,t:0,s:0};
+      inc.forEach(function(r){var s=calcDue(r.HAN_XU_LY,r.TINH_TRANG);if(s==='Quá hạn')c.q++;else if(s==='Đến hạn hôm nay')c.t++;else if(s==='Sắp đến hạn')c.s++});
+      return 'Bản độc lập không gửi được email. Hiện có: '+c.q+' văn bản quá hạn, '+c.t+' đến hạn hôm nay, '+c.s+' sắp đến hạn.';
+    },
+    sendReminderForDocument:async function(){perm(['ADMIN','QUAN_LY']);return 'Bản chạy độc lập trên GitHub không gửi được email.'},
+    getFileData:async function(fileId){
+      if(!fileId)throw new Error('Thiếu file ID.');
+      var known=db.incoming.concat(db.outgoing).some(function(r){return String(r.FILE_ID)===String(fileId)});
+      if(!known)throw new Error('File không thuộc hệ thống.');
+      var f=await idbGet('files',String(fileId));
+      if(!f)throw new Error('Không tìm thấy file (có thể đã bị xóa khỏi trình duyệt này).');
+      return {id:String(fileId),name:f.name,mimeType:guessMime(f.mimeType,f.name),size:f.size,base64:f.base64,converted:false,note:''};
+    },
+    changePassword:changePassword
+  };
+
+  async function api(token,fn,args){
+    await init();
+    if(!Object.prototype.hasOwnProperty.call(API,fn))throw new Error('Chức năng không hợp lệ.');
+    var id=token?sessions()[token]:null;
+    if(!id)throw new Error('PHIEN_HET_HAN');
+    var u=db.users.find(function(x){return String(x.ID)===String(id)});
+    if(!u||!isUserActive(u))throw new Error('PHIEN_HET_HAN');
+    cur=publicUser(u);
+    var res=await API[fn].apply(null,Array.isArray(args)?args:[]);
+    await save();
+    return res===undefined?null:res;
+  }
+
+  /* ---------- Sao lưu / Khôi phục ---------- */
+  async function exportAll(){
+    await init();
+    var keys=await idbAllKeys('files'),f={};
+    for(var i=0;i<keys.length;i++)f[keys[i]]=await idbGet('files',keys[i]);
+    return JSON.stringify({app:'qlvb-standalone',version:1,exportedAt:nowStr(),db:db,files:f});
+  }
+  async function importAll(text){
+    var o=JSON.parse(text);
+    if(!o||o.app!=='qlvb-standalone'||!o.db)throw new Error('File sao lưu không hợp lệ.');
+    await init();
+    var keys=await idbAllKeys('files');
+    for(var i=0;i<keys.length;i++)await idbDel('files',keys[i]);
+    db=o.db;await save();
+    var fk=Object.keys(o.files||{});
+    for(var j=0;j<fk.length;j++)await idbPut('files',fk[j],o.files[fk[j]]);
+    putSessions({});
+  }
+  async function hasUsers(){await init();return db.users.length>0}
+  return {init:init,login:login,logout:logout,api:api,exportAll:exportAll,importAll:importAll,hasUsers:hasUsers};
+})();
+
+</script>
+<script>
 let DATA=null, currentUser=null;
 
 var TOKEN='';
 try{TOKEN=sessionStorage.getItem('qlvb_token')||''}catch(e){}
 function setToken(t){TOKEN=t||'';try{if(t)sessionStorage.setItem('qlvb_token',t);else sessionStorage.removeItem('qlvb_token')}catch(e){}}
 // ====== CẤU HÌNH KHI CHẠY TRÊN GITHUB PAGES ======
-// Dán URL Web App của Apps Script (kết thúc bằng /exec) vào giữa hai dấu nháy.
-// Nếu mở trang trực tiếp từ link Web App của Apps Script thì để trống cũng được.
-var WEB_APP_URL='https://script.google.com/macros/s/AKfycbxQnFm7_vZKL8YajhTxXmXOy-E7ef-IqX1HQzG9JL3r7LGy_WdmbWmDj53fU7ostTnGWw/exec';
+// ĐỂ TRỐNG = chạy ĐỘC LẬP, dữ liệu lưu trong trình duyệt (không cần Apps Script).
+// Muốn nối với Apps Script thì dán URL Web App (kết thúc bằng /exec) vào giữa hai dấu nháy.
+var WEB_APP_URL='';
+
 function run(fn,args){
   return new Promise(function(resolve,reject){
     // Chạy bên trong Apps Script: dùng google.script.run như cũ
@@ -270,9 +645,21 @@ function run(fn,args){
         .withFailureHandler(function(e){reject(new Error((e&&e.message)||String(e)))})
         [fn].apply(null,args);
     }
-    // Chạy trên GitHub Pages: gọi Web App bằng fetch
-    if(!WEB_APP_URL||WEB_APP_URL.indexOf('https://script.google.com/')!==0){
+    // Chế độ ĐỘC LẬP (mặc định khi WEB_APP_URL để trống): dữ liệu lưu trong trình duyệt
+    if(!WEB_APP_URL){
+      var p;
+      if(fn==='login')p=LocalBackend.login.apply(null,args);
+      else if(fn==='logout')p=LocalBackend.logout.apply(null,args);
+      else if(fn==='api')p=LocalBackend.api.apply(null,args);
+      else p=Promise.reject(new Error('Chức năng không hợp lệ.'));
+      return p.then(resolve,function(e){reject(new Error((e&&e.message)||String(e)))});
+    }
+    // Chạy trên GitHub Pages với Apps Script: gọi Web App bằng fetch
+    if(!WEB_APP_URL){
       return reject(new Error('Chưa cấu hình WEB_APP_URL trong file index.html (dán URL Web App kết thúc bằng /exec).'));
+    }
+    if(!/^https:\/\/script\.google\.com\/(a\/[^\/]+\/)?macros\/s\/[A-Za-z0-9_-]{20,}\/exec$/.test(WEB_APP_URL)){
+      return reject(new Error('WEB_APP_URL chưa đúng: phải là URL thật chép từ Apps Script (dạng https://script.google.com/macros/s/.../exec), không phải URL mẫu.'));
     }
     fetch(WEB_APP_URL,{
       method:'POST',
@@ -285,7 +672,7 @@ function run(fn,args){
         throw new Error('Máy chủ không trả dữ liệu hợp lệ. Kiểm tra Web App đã Deploy phiên bản mới và quyền truy cập là "Bất kỳ ai".');
       }
       if(j&&j.ok)resolve(j.data);else reject(new Error((j&&j.error)||'Lỗi không xác định.'));
-    }).catch(function(e){reject(new Error(e&&e.message?e.message:String(e)))});
+    }).catch(function(e){reject(new Error(/Failed to fetch|NetworkError|Load failed/i.test(e&&e.message||'')?'Không kết nối được máy chủ Apps Script. Kiểm tra URL Web App, đã Deploy phiên bản mới và quyền truy cập là "Bất kỳ ai".':(e&&e.message?e.message:String(e))))});
   });
 }
 async function gas(fn,args){
@@ -1026,6 +1413,38 @@ function readFile(file){
 }
 initSidebar();
 if(TOKEN){loadData()}else{showLogin('')}
+</script>
+
+<script>
+(function(){
+  if(typeof WEB_APP_URL!=='undefined'&&WEB_APP_URL)return;
+  if(typeof google!=='undefined'&&google.script&&google.script.run)return;
+  function el(t,css,html){var e=document.createElement(t);e.style.cssText=css;e.innerHTML=html||'';return e}
+  window.addEventListener('DOMContentLoaded',function(){
+    LocalBackend.hasUsers().then(function(has){
+      var f=document.getElementById('lg_err');
+      if(!has&&f&&f.parentNode){
+        var n=el('div','background:#eff8ff;border:1px solid #b2ddff;color:#175cd3;border-radius:8px;padding:10px;font-size:13px;margin:10px 0','<b>Lần đầu sử dụng:</b> nhập tên đăng nhập (chữ không dấu, từ 3 ký tự) và mật khẩu (từ 6 ký tự) bạn muốn dùng. Tài khoản này sẽ trở thành <b>quản trị viên</b>.');
+        f.parentNode.insertBefore(n,f);
+      }
+    }).catch(function(e){var f=document.getElementById('lg_err');if(f){f.textContent=e.message;f.style.display='block'}});
+    var bar=el('div','position:fixed;right:12px;bottom:12px;z-index:50;display:flex;gap:6px;background:#fff;border:1px solid #d0d5dd;border-radius:10px;padding:6px;box-shadow:0 4px 14px #0002;font-size:12px');
+    var b1=el('button','border:0;background:#e9eefb;color:#163b7a;border-radius:7px;padding:7px 10px;cursor:pointer','💾 Sao lưu');
+    var b2=el('button','border:0;background:#fef0c7;color:#93370d;border-radius:7px;padding:7px 10px;cursor:pointer','📥 Khôi phục');
+    var inp=el('input','display:none');inp.type='file';inp.accept='.json,application/json';
+    b1.title='Tải file sao lưu toàn bộ dữ liệu về máy';b2.title='Nạp lại dữ liệu từ file sao lưu (thay thế dữ liệu hiện tại)';
+    b1.onclick=function(){LocalBackend.exportAll().then(function(t){
+      var d=new Date(),n='saoluu-quanlyvanban-'+d.getFullYear()+('0'+(d.getMonth()+1)).slice(-2)+('0'+d.getDate()).slice(-2)+'.json';
+      var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'application/json'}));a.download=n;document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},500);
+    }).catch(function(e){alert('Không sao lưu được: '+e.message)})};
+    b2.onclick=function(){inp.click()};
+    inp.onchange=function(){var f=inp.files[0];if(!f)return;
+      if(!confirm('Khôi phục sẽ THAY THẾ toàn bộ dữ liệu hiện tại bằng nội dung file sao lưu. Tiếp tục?')){inp.value='';return}
+      var r=new FileReader();r.onload=function(){LocalBackend.importAll(String(r.result)).then(function(){alert('Đã khôi phục. Trang sẽ tải lại, hãy đăng nhập.');location.reload()}).catch(function(e){alert('Không khôi phục được: '+e.message)})};
+      r.readAsText(f);inp.value=''};
+    bar.appendChild(b1);bar.appendChild(b2);bar.appendChild(inp);document.body.appendChild(bar);
+  });
+})();
 </script>
 </body>
 </html>
