@@ -257,15 +257,36 @@ let DATA=null, currentUser=null;
 var TOKEN='';
 try{TOKEN=sessionStorage.getItem('qlvb_token')||''}catch(e){}
 function setToken(t){TOKEN=t||'';try{if(t)sessionStorage.setItem('qlvb_token',t);else sessionStorage.removeItem('qlvb_token')}catch(e){}}
+// ====== CẤU HÌNH KHI CHẠY TRÊN GITHUB PAGES ======
+// Dán URL Web App của Apps Script (kết thúc bằng /exec) vào giữa hai dấu nháy.
+// Nếu mở trang trực tiếp từ link Web App của Apps Script thì để trống cũng được.
+var WEB_APP_URL='';
+
 function run(fn,args){
   return new Promise(function(resolve,reject){
-    if(typeof google==='undefined'||!google.script||!google.script.run){
-      return reject(new Error('Trang phải được mở qua URL Web App của Apps Script (không mở trực tiếp file HTML).'));
+    // Chạy bên trong Apps Script: dùng google.script.run như cũ
+    if(typeof google!=='undefined'&&google.script&&google.script.run){
+      return google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(function(e){reject(new Error((e&&e.message)||String(e)))})
+        [fn].apply(null,args);
     }
-    google.script.run
-      .withSuccessHandler(resolve)
-      .withFailureHandler(function(e){reject(new Error((e&&e.message)||String(e)))})
-      [fn].apply(null,args);
+    // Chạy trên GitHub Pages: gọi Web App bằng fetch
+    if(!WEB_APP_URL||WEB_APP_URL.indexOf('https://script.google.com/')!==0){
+      return reject(new Error('Chưa cấu hình WEB_APP_URL trong file index.html (dán URL Web App kết thúc bằng /exec).'));
+    }
+    fetch(WEB_APP_URL,{
+      method:'POST',
+      redirect:'follow',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify({fn:fn,args:args})
+    }).then(function(r){return r.text()}).then(function(t){
+      var j;
+      try{j=JSON.parse(t)}catch(e){
+        throw new Error('Máy chủ không trả dữ liệu hợp lệ. Kiểm tra Web App đã Deploy phiên bản mới và quyền truy cập là "Bất kỳ ai".');
+      }
+      if(j&&j.ok)resolve(j.data);else reject(new Error((j&&j.error)||'Lỗi không xác định.'));
+    }).catch(function(e){reject(new Error(e&&e.message?e.message:String(e)))});
   });
 }
 async function gas(fn,args){
@@ -426,6 +447,7 @@ function renderIncoming(){
     +(canWrite()?iconBtn('💬','Thêm ghi chú','openNote(\'DEN\',\''+attr(r.ID)+'\')'):'')
     +(canWrite()&&r.HAN_XU_LY&&r.TINH_TRANG!=='Đã hoàn thành'?iconBtn('🔔','Nhắc việc ngay cho người xử lý','remindNow(\''+attr(r.ID)+'\',this)'):'')
     +(isManager()?iconBtn('🗄️','Lưu trữ','archiveItem(\'DEN\',\''+attr(r.ID)+'\')'):'')
+    +(isAdmin()?iconBtn('🗑️','Xóa văn bản và file trong Drive','deleteItem(\'DEN\',\''+attr(r.ID)+'\')'):'')
     +'</div></td></tr>'}).join('')||'<tr><td colspan="12\" class="empty">Không có dữ liệu</td></tr>';
 }
 function renderOutgoing(){
@@ -439,6 +461,7 @@ function renderOutgoing(){
     +(canEditRec(r,'DI')&&r.TINH_TRANG!=='Đã hoàn thành'?iconBtn('✅','Đánh dấu hoàn thành','completeItem(\'DI\',\''+attr(r.ID)+'\')'):'')
     +(canWrite()?iconBtn('💬','Thêm ghi chú','openNote(\'DI\',\''+attr(r.ID)+'\')'):'')
     +(isManager()?iconBtn('🗄️','Lưu trữ','archiveItem(\'DI\',\''+attr(r.ID)+'\')'):'')
+    +(isAdmin()?iconBtn('🗑️','Xóa văn bản và file trong Drive','deleteItem(\'DI\',\''+attr(r.ID)+'\')'):'')
     +'</div></td></tr>'}).join('')||'<tr><td colspan="9\" class="empty">Không có dữ liệu</td></tr>';
 }
 function iconBtn(icon,title,onclick,disabled){
@@ -763,7 +786,7 @@ async function previewFile(id){
   // giữ lại cho tương thích: mở nhanh khung xem nội dung của file
   showLoading(true);
   try{
-    const f=await gas('getFileData',[id,true]);
+    const f=await gas('getFileData',[id]);
     openModal('👁️ Xem trước: '+f.name,'<div id="pvBox" style="max-height:70vh;overflow:auto;background:#f2f4f7;padding:4px"><div class="empty">Đang hiển thị...</div></div>'
       +(f.note?'<div class="sub" style="color:#b42318;padding:6px 2px">'+esc(f.note)+'</div>':'')
       +'<div class="actions"><button class="btn primary" onclick="downloadFile(\''+attr(id)+'\')">⬇️ Tải file gốc</button></div>');
@@ -837,16 +860,16 @@ function dtFoot(){
   if(canWrite())h+='<button class="btn" onclick="openNote(\''+DT.type+'\',\''+attr(DT.id)+'\')">💬 Ghi chú</button>';
   if(canEditRec(r,DT.type)&&r.TINH_TRANG!=='Đã hoàn thành')h+='<button class="btn" onclick="completeItem(\''+DT.type+'\',\''+attr(DT.id)+'\')">✅ Hoàn thành</button>';
   if(canEditRec(r,DT.type))h+='<button class="btn primary" onclick="closeDetail();'+(DT.type==='DEN'?'openIncoming':'openOutgoing')+'(\''+attr(DT.id)+'\')">✏️ Sửa</button>';
+  if(isAdmin())h+='<button class="btn" style="color:#b42318" onclick="deleteItem(\''+DT.type+'\',\''+attr(DT.id)+'\')">🗑️ Xóa</button>';
   h+='<button class="btn" onclick="closeDetail()">Đóng</button>';
   f.innerHTML=h;
 }
 async function dtLoadContent(){
   var box=document.getElementById('dtContent');
   try{
-    if(!DT.file)DT.file=await gas('getFileData',[DT.rec.FILE_ID,true]);
+    if(!DT.file)DT.file=await gas('getFileData',[DT.rec.FILE_ID]);
     if(DT.tab!=='content')return;
     box=document.getElementById('dtContent');if(!box)return;
-    if(DT.file.note)box.insertAdjacentHTML('beforebegin','<div class="sub" style="color:#b42318;padding:4px 6px">'+esc(DT.file.note)+'</div>');
     box.style.overflow='auto';box.style.height='100%';
     await renderFileInto(DT.file,box);
   }catch(e){if(box)box.innerHTML='<div class="empty">Không tải được nội dung: '+esc(e.message)+'</div>'}
@@ -854,12 +877,25 @@ async function dtLoadContent(){
 async function dtOpenNewTab(btn){
   var old=btn.textContent;btn.disabled=true;btn.textContent='Đang mở...';
   try{
-    var f=await gas('getFileData',[DT.rec.FILE_ID,true]);
+    var f=await gas('getFileData',[DT.rec.FILE_ID]);
     var u=fileToBlobUrl(f);
     var w=window.open(u,'_blank');
     if(!w)alert('Trình duyệt chặn mở tab mới. Hãy dùng “Tải xuống” hoặc “Xem nội dung”.');
   }catch(e){alert(e.message)}
   finally{btn.disabled=false;btn.textContent=old}
+}
+async function deleteItem(type,id){
+  var r=dtFind(type,id)||{};
+  var msg='XÓA văn bản "'+(r.SO_VAN_BAN||'')+' - '+(r.TEN_VAN_BAN||'')+'"?\n\n'+(r.FILE_ID?'File đính kèm "'+(r.FILE_NAME||'')+'" cũng sẽ bị xóa khỏi Google Drive.\n\n':'')+'Thao tác này không thể hoàn tác trên ứng dụng.';
+  if(!confirm(msg))return;
+  var wasOpen=document.getElementById('detail').classList.contains('show');
+  showLoading(true);
+  try{
+    var res=await gas('deleteRecord',[type,id]);
+    if(wasOpen)closeDetail();
+    await loadData();
+    alert((res&&res.message)||'Đã xóa văn bản.');
+  }catch(e){showLoading(false);alert(e.message)}
 }
 async function completeItem(type,id){
   if(!confirm('Đánh dấu văn bản này là ĐÃ HOÀN THÀNH?'))return;
@@ -898,7 +934,7 @@ function saveLastFile(){
 }
 async function downloadFile(id){
   showLoading(true);
-  try{window.__lastFile=await gas('getFileData',[id,false]);saveLastFile()}
+  try{window.__lastFile=await gas('getFileData',[id]);saveLastFile()}
   catch(e){alert(e.message)}
   finally{showLoading(false)}
 }
